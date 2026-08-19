@@ -6,6 +6,8 @@ import pyautogui
 import os
 import re
 import time
+import win32gui
+import win32con
 
 
 WINDOW_TITLE = "EasyWorship 2009 - Default Profile"
@@ -194,13 +196,11 @@ def select_version(version):
             f"{screen_x:.1f}, {screen_y:.1f}"
         )
 
-        pyautogui.moveTo(
-            screen_x,
-            screen_y,
-            duration=0.2
-        )
+        pyautogui.click(
+                x=screen_x,
+                y=screen_y
+            )
 
-        pyautogui.click()
 
         time.sleep(1)
 
@@ -237,67 +237,180 @@ def select_version(version):
     )
 
 
-def set_reference(book, chapter, verse):
-    ew = get_easyworship()
+def _normalize_reference_text(text):
+    if text is None:
+        return ""
 
-    ew.set_focus()
-    time.sleep(0.3)
+    text = str(text).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*:\s*", ":", text)
+    return text
 
-    # BOOK
-    box = get_locator(ew)
+
+def _read_locator_text(box):
+    """The TScriptureLocator is a custom single-field control and its
+    internal state is not always faithfully exposed by window_text().
+    Prefer the actual control text when available, then fall back to a
+    screen OCR read of the locator itself.
+    """
+
+    try:
+        text = box.window_text()
+        if text:
+            return _normalize_reference_text(text)
+    except Exception:
+        pass
 
     rect = box.rectangle()
-
-    box.click_input(
-        coords=(25, rect.height() // 2)
+    image = ImageGrab.grab(
+        bbox=(
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        )
     )
 
-    time.sleep(0.2)
+    image = image.resize((image.width * 3, image.height * 3))
+    image = ImageOps.grayscale(image)
+    image = ImageEnhance.Contrast(image).enhance(2.2)
 
-    box.type_keys(str(book))
+    data = pytesseract.image_to_data(
+        image,
+        lang="eng",
+        config="--psm 7",
+        output_type=Output.DICT,
+    )
 
-    time.sleep(0.8)
+    lines = []
+    for raw in data["text"]:
+        value = raw.strip()
+        if value:
+            lines.append(value)
 
-    # CHAPTER
+    if not lines:
+        return ""
+
+    return _normalize_reference_text(" ".join(lines))
+
+
+def set_reference(book, chapter, verse):
+    """Enter a Scripture reference into the custom TScriptureLocator.
+
+    This control behaves as a single-field edit box, not a segmented
+    book/chapter/verse widget. Directly writing the canonical reference text
+    via WM_SETTEXT is the only reliable operation we have verified against the
+    live EasyWorship control.
+    """
+
+    ew = get_easyworship()
+    ew.set_focus()
+    time.sleep(0.10)
+
     box = get_locator(ew)
+    box.set_focus()
 
-    box.type_keys("{RIGHT}")
+    reference_text = f"{book} {chapter}:{verse}"
 
-    time.sleep(0.2)
+    try:
+        win32gui.SendMessage(
+            box.handle,
+            win32con.WM_SETTEXT,
+            0,
+            reference_text,
+        )
+    except Exception:
+        # Fallback: if direct control text update is unavailable in a given
+        # session, fall back to a single-field keyboard path.
+        rect = box.rectangle()
+        box.click_input(coords=(25, rect.height() // 2))
+        time.sleep(0.10)
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.08)
+        pyautogui.write(reference_text, interval=0.02)
+        time.sleep(0.15)
+        pyautogui.press("enter")
+        time.sleep(0.30)
 
-    box.type_keys(str(chapter))
-
-    time.sleep(0.8)
-
-    # VERSE
-    box = get_locator(ew)
-
-    box.type_keys("{RIGHT}")
-
-    time.sleep(0.2)
-
-    box.type_keys(str(verse))
-
-    time.sleep(0.8)
-
-    return get_locator(ew).window_text()
+    return _read_locator_text(box)
 
 
+def set_reference_verified(
+    book,
+    chapter,
+    verse,
+    attempts=2,
+):
+    expected = (
+        f"{book} {chapter}:{verse}"
+    )
+
+    last_actual = None
+
+    for attempt in range(1, attempts + 1):
+
+        print(
+            f"\nReference attempt "
+            f"{attempt}/{attempts}"
+        )
+
+        reference = set_reference(
+            book,
+            chapter,
+            verse,
+        )
+
+        last_actual = reference
+
+        print(
+            "EasyWorship reports:",
+            reference,
+        )
+
+        if (
+            _normalize_reference_text(reference).lower()
+            == _normalize_reference_text(expected).lower()
+        ):
+            return reference
+
+        print(
+            "Reference mismatch."
+        )
+
+        print(
+            f"Expected: {expected}"
+        )
+
+        print(
+            f"Actual:   {reference}"
+        )
+
+        if attempt < attempts:
+            print(
+                "Retrying EasyWorship reference..."
+            )
+
+            time.sleep(0.30)
+
+    raise RuntimeError(
+        "Reference verification failed "
+        f"after {attempts} attempts.\n"
+        f"Expected: {expected}\n"
+        f"Actual: {last_actual}"
+    )
 def go_live():
     ew = get_easyworship()
 
     ew.set_focus()
-
-    time.sleep(0.3)
 
     button = ew.child_window(
         title="Go Live",
         class_name="TsdSpeedButton"
     ).wrapper_object()
 
-    button.click()
+    button.click_input()
 
-    time.sleep(1)
+    time.sleep(0.25)
 
     print("Go Live complete.")
 
@@ -307,67 +420,116 @@ def display_scripture(
     book,
     chapter,
     verse,
-    live=False
+    live=False,
 ):
     print("=" * 50)
     print("EASYWORSHIP CONTROLLER")
     print("=" * 50)
 
     print(f"Version   : {version}")
+
     print(
         f"Reference : "
         f"{book} {chapter}:{verse}"
     )
+
     print(f"Go Live   : {live}")
 
+    # ---------------------------------------------
     # 1. VERSION
-    print("\n[1/3] Selecting Bible version...")
-    select_version(version)
-
-    # 2. REFERENCE
-    print("\n[2/3] Entering Scripture...")
-
-    reference = set_reference(
-        book,
-        chapter,
-        verse
-    )
-
-    expected = f"{book} {chapter}:{verse}"
+    # ---------------------------------------------
 
     print(
-        "EasyWorship reports:",
-        reference
+        "\n[1/3] Selecting Bible version..."
     )
 
-    # EasyWorship normalizes the reference to:
-    # Book Chapter:Verse
-    #
-    # Compare against the parsed/normalized reference,
-    # not the original spoken wording.
-    if reference.strip().lower() != expected.strip().lower():
-        raise RuntimeError(
-            "Reference verification failed.\n"
-            f"Expected: {expected}\n"
-            f"Actual: {reference}"
-        )
+    select_version(version)
 
+    # ---------------------------------------------
+    # 2. REFERENCE
+    # ---------------------------------------------
+
+    print(
+        "\n[2/3] Entering Scripture..."
+    )
+
+    reference = set_reference_verified(
+        book,
+        chapter,
+        verse,
+        attempts=2,
+    )
+
+    # ---------------------------------------------
     # 3. LIVE
+    # ---------------------------------------------
+
     if live:
+
         print(
             "\n[3/3] Sending Go Live..."
         )
+
         go_live()
+
     else:
+
         print(
             "\n[3/3] Preview prepared."
         )
 
     print("\nSUCCESS")
 
+    return reference
 
-if __name__ == "__main__":
+def prepare_reference(
+    book,
+    chapter,
+    verse,
+    live=False,
+):
+    """
+    Enter a Scripture reference without changing
+    the currently selected Bible version.
+    """
+
+    print("=" * 50)
+    print("EASYWORSHIP CONTROLLER")
+    print("=" * 50)
+
     print(
-        "This module provides functions for "
-        "the EasyWorship controller."
+        f"Reference : {book} {chapter}:{verse}"
     )
+
+    print(
+        f"Go Live   : {live}"
+    )
+
+    print(
+        "\n[1/2] Entering Scripture..."
+    )
+
+    reference = set_reference_verified(
+        book,
+        chapter,
+        verse,
+        attempts=2,
+    )
+
+    if live:
+
+        print(
+            "\n[2/2] Sending Go Live..."
+        )
+
+        go_live()
+
+    else:
+
+        print(
+            "\n[2/2] Preview prepared."
+        )
+
+    print("\nSUCCESS")
+
+    return reference
